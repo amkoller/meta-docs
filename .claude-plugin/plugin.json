@@ -1,0 +1,18 @@
+{
+  "$schema": "https://anthropic.com/claude-code/plugin.schema.json",
+  "name": "meta-docs",
+  "version": "0.1.0",
+  "description": "Three composable skills for managing meta-documentation about a codebase: meta-doc-manager tracks topics, modules, and documents in a SQLite index; write-meta-doc authors new documents (functional reviews, user manuals, code reviews, test plans, etc.) and registers them; process-meta-doc consumes registered docs to answer questions and triage review findings.",
+  "author": {
+    "name": "Andrew Koller"
+  },
+  "homepage": "https://github.com/akoller/meta-docs",
+  "keywords": [
+    "documentation",
+    "meta-docs",
+    "code-review",
+    "functional-review",
+    "test-plan",
+    "skills"
+  ]
+}
