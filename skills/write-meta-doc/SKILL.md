@@ -90,15 +90,20 @@ The skill supports multiple **flavors** of meta-document. Each flavor has its ow
 Ask the user which flavor they want unless it's obvious from their initial request. Common flavors (freeform — use what the project already uses; check with `cm doc list --db <DB> --format table`):
 
 - `functional-doc` — what each module is for and how it actually behaves (user-facing + internal). **Inlined below.**
+- `test-plan` — what should be tested for the in-scope modules, at a planning level (existing coverage + gaps + infra notes). **Inlined below.**
 - `user-manual` — end-user-facing operation guide. *(Not yet inlined.)*
 - `code-review/<subtype>` — security, consistency, performance, etc. *(Not yet inlined.)*
-- `test-plan`, `test-coverage`, `todos` — *(Not yet inlined.)*
+- `test-coverage`, `todos` — *(Not yet inlined.)*
 
 For not-yet-inlined flavors, tell the user the flavor isn't implemented yet and either (a) ask permission to draft it inline ad-hoc using the same scoping/registration scaffolding, or (b) stop and suggest extending this skill.
 
 ### Flavor: functional-doc (inlined)
 
 See `references/functional-doc.md` for the full drafting procedure. Read it now if the user picked this flavor.
+
+### Flavor: test-plan (inlined)
+
+See `references/test-plan.md` for the full drafting procedure. Read it now if the user picked this flavor. Note: a test plan leans on the functional review for the same topic scope; if one doesn't exist, that reference explains how to handle it.
 
 ### Future-flavor contract (for when flavors become their own skills)
 

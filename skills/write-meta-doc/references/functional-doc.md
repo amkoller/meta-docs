@@ -33,6 +33,14 @@ Read the actual code for each module in scope. You're reading it for **what the 
 
 For directory modules, read enough to identify the meaningful behavior — you don't need every line. Files you keep returning to are the ones to ground claims in; throwaway helpers usually don't make the doc.
 
+**Also read any relevant automated test coverage** — unit tests, integration tests, end-to-end tests that exercise the in-scope modules. Tests are a second source of truth for *intended* behavior: they encode the invariants and edge cases the author thought mattered, often more explicitly than the production code does. Use them to:
+
+- Confirm or correct behaviors inferred from reading the code (if a test asserts X but you thought the code did Y, dig in).
+- Surface behaviors you might otherwise miss — error paths, retry semantics, boundary conditions.
+- Distinguish "the code happens to do this" from "the system is required to do this".
+
+When tests and code disagree, note it as an open question or — if you're confident — as a Part 2 behavioral bug. Don't treat tests as gospel; they can be stale too. But they're high-signal evidence about what the author *meant*.
+
 While reading, keep a running list of:
 - Functional concepts emerging from what you're reading — bootstrap, install lifecycle, authentication, sync, persistence, etc. These are your future section headings.
 - Things you don't understand and need to ask the user about.

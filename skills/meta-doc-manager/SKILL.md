@@ -19,6 +19,21 @@ Three core entities, plus join tables:
 
 The skill is agnostic to flavors — users define their own. Recommend, don't enforce, a starter taxonomy when the user asks.
 
+## Topics vs. modules: two independent axes
+
+Topics and modules describe the same codebase along two **independent** axes; the index's job is to map between them.
+
+- **Topics are functional.** What the system *does* — behaviors, features, capabilities, named without reference to code layout. "Frontend", "backend", "the API package", "shared utils" are not topics; they're code divisions. If a proposed topic could only be named by reading the directory tree, it's a module grouping in disguise.
+
+- **Modules are implementation.** How the code is actually organized — real files, directories, and symbols. Carved along the grain of the codebase so they point at concrete code.
+
+### The mapping is many-to-many
+
+A module may serve many functions; a function may span many modules. Do **not** force each module to its single "primary" topic — that discards the cross-cutting structure the index exists to capture.
+
+- A shared/foundational module (core utils, shared types, API-contracts package, design-system library) legitimately maps to **many** topics. Assign it to *every* functional area it materially supports. A core utils package landing on half the topics isn't noise — it's an accurate record that those features rest on it, and makes "what depends on core?" directly answerable.
+- Conversely, one topic (e.g. "voice transcription") is often realized across several modules (mobile recorder, backend handler, shared contract). Link the topic to all of them.
+
 ## When to use this skill
 
 Use this skill when the user is curating documentation *about* a codebase rather than writing the code itself. Concretely:
