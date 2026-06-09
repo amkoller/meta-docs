@@ -1,0 +1,25 @@
+{
+  "$schema": "https://anthropic.com/claude-code/marketplace.schema.json",
+  "name": "meta-docs",
+  "owner": {
+    "name": "Aaron Koller"
+  },
+  "plugins": [
+    {
+      "name": "meta-docs",
+      "source": ".",
+      "description": "Four composable skills for managing meta-documentation about a codebase: meta-doc-manager (SQLite index of topics, modules, and documents), write-meta-doc (authors new docs and registers them), process-meta-doc (consumes registered docs for Q&A and review-finding triage), and todo-manager (AI-native todo tracking with priority, status, assignment, and blocking).",
+      "version": "0.1.0",
+      "homepage": "https://github.com/amkoller/meta-docs",
+      "keywords": [
+        "documentation",
+        "meta-docs",
+        "code-review",
+        "functional-review",
+        "test-plan",
+        "todos",
+        "skills"
+      ]
+    }
+  ]
+}
