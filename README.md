@@ -1,66 +1,24 @@
-# meta-docs
+Meta-docs for codebases
 
-Three composable Claude Code skills for managing **meta-documentation** about a codebase — the topics it's organized into, the modules (files, dirs, symbols) that belong to each topic, and the documents (functional reviews, user manuals, code reviews, test plans, todos, etc.) that describe, audit, or plan them.
+Systematically draft all kinds of documents about your codebase (“meta-docs”), organized primarily by functional / conceptual “topic” that tag modules in code. Suggested types of meta docs include:
 
-The three skills form a producer / index / consumer trio:
+* Functional review and functional documentation  
+  * Stating both the purpose of various modules within a topic, and the actual behavior of those modules.   
+* Automated test plans, describing the desired automated tests of topics  
+* Review of automated test coverage and its alignment with test plans  
+* Implementation (code) review and documentation  
+* User-facing documentation, i.e. “the manual”
 
-| Skill | Role |
-|---|---|
-| **meta-doc-manager** | Index. Tracks topics, modules, and document registrations in a per-project SQLite database. Provides a `cm.py` CLI. Track-and-index only — does not author content. |
-| **write-meta-doc** | Producer. Drives an authoring loop (topic scope → module scope → drafting → registration) for new meta-documents and registers them via meta-doc-manager. |
-| **process-meta-doc** | Consumer. Uses registered docs to answer questions about the codebase or to walk the user through Part-2-style review findings (questionable purposes, missing behaviors, suggestions). |
+and of course:
 
-## Installation
+* Todos \- things we want to implement within a topic
 
-### As a Claude Code plugin
+meta-docs also includes an AI-native todo manager: 
 
-Add this repo as a marketplace and install the plugin:
-
-```
-/plugin marketplace add https://github.com/akoller/meta-docs
-/plugin install meta-docs
-```
-
-All three skills become available together.
-
-### Manual (symlink into ~/.claude/skills/)
-
-```sh
-git clone https://github.com/akoller/meta-docs.git
-ln -s "$PWD/meta-docs/skills/meta-doc-manager" ~/.claude/skills/meta-doc-manager
-ln -s "$PWD/meta-docs/skills/write-meta-doc"   ~/.claude/skills/write-meta-doc
-ln -s "$PWD/meta-docs/skills/process-meta-doc" ~/.claude/skills/process-meta-doc
-```
-
-## Quick start
-
-In a project you want to document, ask Claude:
-
-> Set up meta-docs for this repo — establish topics for the major parts and assign modules to them.
-
-That invokes **meta-doc-manager** to `init` the SQLite index and define topics/modules.
-
-Then:
-
-> Write a functional review of the `auth` topic.
-
-…invokes **write-meta-doc**, which scopes the work, drafts the document with you in the loop, writes it to disk, and registers it back into the index.
-
-Later:
-
-> What does the auth review say about session token storage?
-
-…invokes **process-meta-doc**, which looks up the relevant registered doc and answers with citation.
-
-## Repository layout
-
-```
-.claude-plugin/plugin.json     ← plugin manifest
-skills/
-  meta-doc-manager/            ← SQLite index + cm.py CLI
-  write-meta-doc/              ← authoring workflow
-  process-meta-doc/            ← Q&A + review-processing workflow
-```
+* Track assignment, status, priority, and blocking relationships for “todos” related to meta-docs  
+* Generates a total ordering of priority supporting natural “one at a time” workflows  
+* AI powered prioritization with user configurable heuristics  
+* Supports granular workflows such as auto creating prioritized, assigned todos for reviewing, qa, etc related to the same underlying task
 
 ## License
 
