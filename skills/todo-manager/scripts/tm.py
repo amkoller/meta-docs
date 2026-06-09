@@ -1,11 +1,10 @@
 #!/usr/bin/env python3
 """todo-manager CLI.
 
-Track per-meta-document todos in the same SQLite file used by
-meta-doc-manager. Each todo references a `flavor = 'todo'` document and
-carries workflow state (assignee, status, blocks, priority). See
-SKILL.md in the parent directory for the conceptual model and
-references/schema.md for the underlying schema.
+Track per-meta-document todos in the same DB used by meta-doc-manager (SQLite
+or Postgres). Each todo references a `flavor = 'todo'` document and carries
+workflow state (assignee, status, blocks, priority). See SKILL.md for the
+conceptual model and references/schema.md for the underlying schema.
 """
 
 from __future__ import annotations
@@ -13,9 +12,22 @@ from __future__ import annotations
 import argparse
 import json
 import os
-import sqlite3
 import sys
 from typing import Any, Iterable
+
+# Import the shared backend from meta-doc-manager.
+_META_DOC_SCRIPTS = os.path.abspath(
+    os.path.join(os.path.dirname(__file__), "..", "..", "meta-doc-manager", "scripts")
+)
+sys.path.insert(0, _META_DOC_SCRIPTS)
+from db import (  # noqa: E402
+    TODO_SCHEMA_SQL,
+    Backend,
+    die,
+    new_uuid,
+    now_iso,
+    open_db,
+)
 
 ENV_DB = "META_DOC_MANAGER_DB"
 STATUSES = ("backlog", "in_progress", "in_review", "done")
@@ -38,79 +50,52 @@ DEFAULT_GUIDANCE = (
     "your project's conventions."
 )
 
-SCHEMA_SQL = """
-CREATE TABLE IF NOT EXISTS users (
-  id   INTEGER PRIMARY KEY AUTOINCREMENT,
-  name TEXT NOT NULL UNIQUE
-);
-
-CREATE TABLE IF NOT EXISTS todos (
-  id           INTEGER PRIMARY KEY AUTOINCREMENT,
-  document_id  INTEGER NOT NULL REFERENCES documents(id) ON DELETE CASCADE,
-  assignee_id  INTEGER NULL REFERENCES users(id) ON DELETE SET NULL,
-  status       TEXT NOT NULL DEFAULT 'backlog'
-               CHECK (status IN ('backlog','in_progress','in_review','done')),
-  blocks       TEXT NULL,
-  priority     INTEGER NULL,
-  created_at   TEXT NOT NULL DEFAULT (datetime('now')),
-  updated_at   TEXT NOT NULL DEFAULT (datetime('now'))
-);
-
-CREATE INDEX IF NOT EXISTS idx_todos_status   ON todos(status);
-CREATE INDEX IF NOT EXISTS idx_todos_priority ON todos(priority);
-CREATE INDEX IF NOT EXISTS idx_todos_document ON todos(document_id);
-"""
-
 
 # ---------- helpers ----------
 
-def die(msg: str, code: int = 2) -> None:
-    print(f"error: {msg}", file=sys.stderr)
-    sys.exit(code)
-
-
-def connect(db_path: str, *, require_exists: bool = True) -> sqlite3.Connection:
-    if require_exists and not os.path.exists(db_path):
-        die(f"database not found: {db_path}")
-    conn = sqlite3.connect(db_path)
-    conn.row_factory = sqlite3.Row
-    conn.execute("PRAGMA foreign_keys = ON")
-    return conn
-
-
-def resolve_db(args: argparse.Namespace) -> str:
+def resolve_db_uri(args: argparse.Namespace) -> str:
     db = getattr(args, "db", None) or os.environ.get(ENV_DB)
     if not db:
         die(f"--db is required (or set ${ENV_DB})")
     return db
 
 
-def require_meta_doc_db(conn: sqlite3.Connection) -> None:
-    row = conn.execute(
-        "SELECT name FROM sqlite_master WHERE type='table' AND name='documents'"
-    ).fetchone()
+def connect(args: argparse.Namespace, *, require_exists: bool = True) -> Backend:
+    return open_db(resolve_db_uri(args), require_exists=require_exists)
+
+
+def require_meta_doc_db(db: Backend) -> None:
+    if db.dialect == "sqlite":
+        row = db.fetchone(
+            "SELECT name FROM sqlite_master WHERE type='table' AND name='documents'"
+        )
+    else:
+        row = db.fetchone(
+            "SELECT table_name FROM information_schema.tables "
+            "WHERE table_name = 'documents'"
+        )
     if not row:
         die("this DB has no `documents` table; init it with cm.py first")
 
 
-def get_user_by_name(conn: sqlite3.Connection, name: str) -> sqlite3.Row:
-    row = conn.execute("SELECT * FROM users WHERE name = ?", (name,)).fetchone()
+def get_user_by_name(db: Backend, name: str) -> dict:
+    row = db.fetchone("SELECT * FROM users WHERE name = ?", (name,))
     if not row:
         die(f"no such user: {name}")
     return row
 
 
-def get_todo(conn: sqlite3.Connection, tid: int) -> sqlite3.Row:
-    row = conn.execute("SELECT * FROM todos WHERE id = ?", (tid,)).fetchone()
+def get_todo_by_idx(db: Backend, idx: int) -> dict:
+    row = db.fetchone("SELECT * FROM todos WHERE idx = ?", (idx,))
     if not row:
-        die(f"no todo with id {tid}")
+        die(f"no todo with id {idx}")
     return row
 
 
 def csv_ints(s: str | None) -> list[int]:
     if not s:
         return []
-    out = []
+    out: list[int] = []
     for p in s.split(","):
         p = p.strip()
         if not p:
@@ -123,6 +108,7 @@ def csv_ints(s: str | None) -> list[int]:
 
 
 def parse_blocks_json(s: str | None) -> list[int]:
+    """Parse the stored JSON list of todo idx values."""
     if not s:
         return []
     try:
@@ -135,118 +121,57 @@ def parse_blocks_json(s: str | None) -> list[int]:
 
 
 def canonicalize_blocks(ids: Iterable[int]) -> str | None:
-    """Normalize a list of blocked-todo ids into the stored JSON form."""
     deduped = sorted(set(int(x) for x in ids))
     if not deduped:
         return None
     return json.dumps(deduped)
 
 
-def emit(rows: Iterable[Any], fmt: str, *, columns: list[str] | None = None) -> None:
+def emit(rows: Iterable[dict], fmt: str, *, columns: list[str] | None = None) -> None:
     rows = list(rows)
     if fmt == "json":
-        if rows and isinstance(rows[0], sqlite3.Row):
-            data = [dict(r) for r in rows]
-        else:
-            data = list(rows)
-        print(json.dumps(data, indent=2, default=str))
+        print(json.dumps(rows, indent=2, default=str))
         return
     if not rows:
         print("(no rows)")
         return
     if columns is None:
         columns = list(rows[0].keys())
-    widths = {c: max(len(c), *(len(str(r[c] if r[c] is not None else "")) for r in rows)) for c in columns}
-    header = "  ".join(c.ljust(widths[c]) for c in columns)
-    print(header)
+    widths = {
+        c: max(len(c), *(len(str(r.get(c) if r.get(c) is not None else "")) for r in rows))
+        for c in columns
+    }
+    print("  ".join(c.ljust(widths[c]) for c in columns))
     print("  ".join("-" * widths[c] for c in columns))
     for r in rows:
-        print("  ".join(str(r[c] if r[c] is not None else "").ljust(widths[c]) for c in columns))
+        print("  ".join(
+            str(r.get(c) if r.get(c) is not None else "").ljust(widths[c]) for c in columns
+        ))
 
 
-def load_guidance(conn: sqlite3.Connection) -> str:
-    row = conn.execute("SELECT value FROM config WHERE key = ?", (GUIDANCE_KEY,)).fetchone()
+def load_guidance(db: Backend) -> str:
+    row = db.fetchone("SELECT value FROM config WHERE key = ?", (GUIDANCE_KEY,))
     if not row:
-        die(f"no priority guidance configured; run `tm.py priority guidance set` "
-            f"or rerun `tm.py init` to seed the default")
+        die("no priority guidance configured; run `tm.py priority guidance set` "
+            "or rerun `tm.py init` to seed the default")
     return row["value"]
 
 
-# ---------- commands ----------
-
-def cmd_init(args: argparse.Namespace) -> None:
-    db = resolve_db(args)
-    conn = connect(db, require_exists=False)
-    require_meta_doc_db(conn)
-    conn.executescript(SCHEMA_SQL)
-    # Seed default priority guidance if not already set.
-    existing = conn.execute("SELECT 1 FROM config WHERE key = ?", (GUIDANCE_KEY,)).fetchone()
-    if not existing:
-        conn.execute(
-            "INSERT INTO config(key, value) VALUES (?, ?)",
-            (GUIDANCE_KEY, DEFAULT_GUIDANCE),
-        )
-        print("seeded default priority guidance")
-    conn.commit()
-    print(f"todo-manager tables ready in {db}")
+def validate_status(s: str | None) -> None:
+    if s is not None and s not in STATUSES:
+        die(f"invalid status {s!r}; allowed: {', '.join(STATUSES)}")
 
 
-def cmd_user_add(args: argparse.Namespace) -> None:
-    conn = connect(resolve_db(args))
-    try:
-        cur = conn.execute("INSERT INTO users(name) VALUES (?)", (args.name,))
-    except sqlite3.IntegrityError:
-        die(f"user already exists: {args.name}")
-    conn.commit()
-    print(f"user added: id={cur.lastrowid} name={args.name}")
-
-
-def cmd_user_list(args: argparse.Namespace) -> None:
-    conn = connect(resolve_db(args))
-    rows = conn.execute("SELECT id, name FROM users ORDER BY name").fetchall()
-    emit(rows, args.format, columns=["id", "name"])
-
-
-def cmd_user_delete(args: argparse.Namespace) -> None:
-    conn = connect(resolve_db(args))
-    if args.id is not None:
-        target = args.id
-    else:
-        target = get_user_by_name(conn, args.name)["id"]
-    conn.execute("DELETE FROM users WHERE id = ?", (target,))
-    conn.commit()
-    print(f"user deleted: id={target}")
-
-
-def _resolve_assignee(conn: sqlite3.Connection, name: str | None) -> int | None:
+def _resolve_assignee_uuid(db: Backend, name: str | None) -> str | None:
     if name is None or name.upper() == "NONE":
         return None
-    return get_user_by_name(conn, name)["id"]
+    return get_user_by_name(db, name)["id"]
 
 
-def _validate_blocks(conn: sqlite3.Connection, blocks: list[int], *,
-                     this_id: int | None = None) -> None:
-    """Verify each blocked id exists, isn't self, and doesn't introduce a cycle."""
-    if not blocks:
-        return
-    if this_id is not None and this_id in blocks:
-        die("a todo cannot block itself")
-    for b in blocks:
-        if not conn.execute("SELECT 1 FROM todos WHERE id = ?", (b,)).fetchone():
-            die(f"--blocks references unknown todo id {b}")
-    # Cycle check: build full graph and DFS from `this_id` through proposed edges.
-    if this_id is None:
-        return
-    adj = _build_blocks_graph(conn)
-    adj[this_id] = set(blocks)  # apply proposed change
-    if _has_cycle(adj):
-        die("proposed --blocks would introduce a cycle in the blocking DAG")
-
-
-def _build_blocks_graph(conn: sqlite3.Connection) -> dict[int, set[int]]:
+def _build_blocks_graph(db: Backend) -> dict[int, set[int]]:
     adj: dict[int, set[int]] = {}
-    for r in conn.execute("SELECT id, blocks FROM todos").fetchall():
-        adj[r["id"]] = set(parse_blocks_json(r["blocks"]))
+    for r in db.fetchall("SELECT idx, blocks FROM todos"):
+        adj[r["idx"]] = set(parse_blocks_json(r["blocks"]))
     return adj
 
 
@@ -269,36 +194,104 @@ def _has_cycle(adj: dict[int, set[int]]) -> bool:
     return any(color[n] == WHITE and dfs(n) for n in list(color))
 
 
+def _validate_blocks(db: Backend, blocks: list[int], *,
+                     this_idx: int | None = None) -> None:
+    if not blocks:
+        return
+    if this_idx is not None and this_idx in blocks:
+        die("a todo cannot block itself")
+    for b in blocks:
+        if not db.fetchone("SELECT 1 FROM todos WHERE idx = ?", (b,)):
+            die(f"--blocks references unknown todo id {b}")
+    if this_idx is None:
+        return
+    adj = _build_blocks_graph(db)
+    adj[this_idx] = set(blocks)
+    if _has_cycle(adj):
+        die("proposed --blocks would introduce a cycle in the blocking DAG")
+
+
+# ---------- commands ----------
+
+def cmd_init(args: argparse.Namespace) -> None:
+    db = open_db(resolve_db_uri(args), require_exists=False)
+    require_meta_doc_db(db)
+    db.executescript(TODO_SCHEMA_SQL)
+    existing = db.fetchone("SELECT 1 AS x FROM config WHERE key = ?", (GUIDANCE_KEY,))
+    if not existing:
+        db.execute(
+            "INSERT INTO config(key, value) VALUES (?, ?)",
+            (GUIDANCE_KEY, DEFAULT_GUIDANCE),
+        )
+        print("seeded default priority guidance")
+    db.commit()
+    print(f"todo-manager tables ready in {resolve_db_uri(args)}")
+
+
+def cmd_user_add(args: argparse.Namespace) -> None:
+    db = connect(args)
+    uid = new_uuid()
+    idx = db.next_idx("users")
+    try:
+        db.execute("INSERT INTO users(id, idx, name) VALUES (?, ?, ?)",
+                   (uid, idx, args.name))
+    except db.integrity_error:
+        die(f"user already exists: {args.name}")
+    db.commit()
+    print(f"user added: id={idx} name={args.name}")
+
+
+def cmd_user_list(args: argparse.Namespace) -> None:
+    db = connect(args)
+    rows = db.fetchall("SELECT idx AS id, name FROM users ORDER BY name")
+    emit(rows, args.format, columns=["id", "name"])
+
+
+def cmd_user_delete(args: argparse.Namespace) -> None:
+    db = connect(args)
+    if args.id is not None:
+        row = db.fetchone("SELECT id, idx FROM users WHERE idx = ?", (args.id,))
+        if not row:
+            die(f"no user with id {args.id}")
+    else:
+        row = get_user_by_name(db, args.name)
+    db.execute("DELETE FROM users WHERE id = ?", (row["id"],))
+    db.commit()
+    print(f"user deleted: id={row['idx']}")
+
+
 def cmd_todo_add(args: argparse.Namespace) -> None:
-    conn = connect(resolve_db(args))
-    doc = conn.execute(
-        "SELECT id, flavor, title FROM documents WHERE id = ?", (args.doc_id,)
-    ).fetchone()
+    db = connect(args)
+    doc = db.fetchone(
+        "SELECT id, idx, flavor, title FROM documents WHERE idx = ?", (args.doc_id,)
+    )
     if not doc:
         die(f"no document with id {args.doc_id}")
     if doc["flavor"] != "todo":
         die(f"document {args.doc_id} has flavor {doc['flavor']!r}; "
-            f"todos only attach to docs with flavor 'todo'")
-    assignee_id = _resolve_assignee(conn, args.assignee)
+            "todos only attach to docs with flavor 'todo'")
+    assignee_uuid = _resolve_assignee_uuid(db, args.assignee)
     status = args.status or "backlog"
-    if status not in STATUSES:
-        die(f"invalid status {status!r}; allowed: {', '.join(STATUSES)}")
+    validate_status(status)
     blocks = csv_ints(args.blocks)
-    _validate_blocks(conn, blocks)  # no this_id yet
+    _validate_blocks(db, blocks)
     blocks_json = canonicalize_blocks(blocks)
-    cur = conn.execute(
-        """INSERT INTO todos(document_id, assignee_id, status, blocks, priority)
-           VALUES (?, ?, ?, ?, ?)""",
-        (args.doc_id, assignee_id, status, blocks_json, args.priority),
+    now = now_iso()
+    tid = new_uuid()
+    idx = db.next_idx("todos")
+    db.execute(
+        "INSERT INTO todos(id, idx, document_id, assignee_id, status, blocks, priority, "
+        "created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        (tid, idx, doc["id"], assignee_uuid, status, blocks_json, args.priority, now, now),
     )
-    conn.commit()
-    print(f"todo added: id={cur.lastrowid} document={args.doc_id} status={status}")
+    db.commit()
+    print(f"todo added: id={idx} document={args.doc_id} status={status}")
 
 
 def cmd_todo_list(args: argparse.Namespace) -> None:
-    conn = connect(resolve_db(args))
+    db = connect(args)
     sql = (
-        "SELECT t.id, t.document_id, d.title AS doc_title, "
+        "SELECT t.idx AS id, d.idx AS document_id, d.title AS doc_title, "
         "u.name AS assignee, t.status, t.blocks, t.priority "
         "FROM todos t "
         "JOIN documents d ON d.id = t.document_id "
@@ -307,42 +300,80 @@ def cmd_todo_list(args: argparse.Namespace) -> None:
     params: list[Any] = []
     clauses: list[str] = []
     if args.status:
-        if args.status not in STATUSES:
-            die(f"invalid status {args.status!r}; allowed: {', '.join(STATUSES)}")
+        validate_status(args.status)
         clauses.append("t.status = ?")
         params.append(args.status)
     if args.assignee is not None:
         if args.assignee.upper() == "NONE":
             clauses.append("t.assignee_id IS NULL")
         else:
-            uid = get_user_by_name(conn, args.assignee)["id"]
+            uid = get_user_by_name(db, args.assignee)["id"]
             clauses.append("t.assignee_id = ?")
             params.append(uid)
     if args.doc_id is not None:
+        doc = db.fetchone("SELECT id FROM documents WHERE idx = ?", (args.doc_id,))
+        if not doc:
+            die(f"no document with id {args.doc_id}")
         clauses.append("t.document_id = ?")
-        params.append(args.doc_id)
+        params.append(doc["id"])
     if clauses:
         sql += " WHERE " + " AND ".join(clauses)
-    sql += " ORDER BY t.priority IS NULL, t.priority DESC, t.id ASC"
-    rows = conn.execute(sql, params).fetchall()
+    # Postgres needs NULLS LAST; SQLite tolerates it (since 3.30). Use it everywhere.
+    sql += " ORDER BY t.priority DESC NULLS LAST, t.idx ASC"
+    rows = db.fetchall(sql, params)
+    emit(rows, args.format,
+         columns=["id", "document_id", "doc_title", "assignee", "status", "blocks", "priority"])
+
+
+def cmd_todo_top(args: argparse.Namespace) -> None:
+    """Show the top-N highest-priority todos that aren't done.
+
+    Default excludes `done`; pass --include-done to include it. Tied or
+    NULL priorities sort after numbered ones; ties break by idx ASC.
+    """
+    db = connect(args)
+    sql = (
+        "SELECT t.idx AS id, d.idx AS document_id, d.title AS doc_title, "
+        "u.name AS assignee, t.status, t.blocks, t.priority "
+        "FROM todos t "
+        "JOIN documents d ON d.id = t.document_id "
+        "LEFT JOIN users u ON u.id = t.assignee_id"
+    )
+    params: list[Any] = []
+    clauses: list[str] = []
+    if not args.include_done:
+        clauses.append("t.status != ?")
+        params.append("done")
+    if args.assignee is not None:
+        if args.assignee.upper() == "NONE":
+            clauses.append("t.assignee_id IS NULL")
+        else:
+            uid = get_user_by_name(db, args.assignee)["id"]
+            clauses.append("t.assignee_id = ?")
+            params.append(uid)
+    if clauses:
+        sql += " WHERE " + " AND ".join(clauses)
+    sql += " ORDER BY t.priority DESC NULLS LAST, t.idx ASC"
+    sql += f" LIMIT {int(args.limit)}"
+    rows = db.fetchall(sql, params)
     emit(rows, args.format,
          columns=["id", "document_id", "doc_title", "assignee", "status", "blocks", "priority"])
 
 
 def cmd_todo_show(args: argparse.Namespace) -> None:
-    conn = connect(resolve_db(args))
-    todo = get_todo(conn, args.id)
-    doc = conn.execute(
-        "SELECT id, flavor, title, doc_path, content, summary FROM documents WHERE id = ?",
+    db = connect(args)
+    todo = get_todo_by_idx(db, args.id)
+    doc = db.fetchone(
+        "SELECT idx, flavor, title, doc_path, content, summary FROM documents WHERE id = ?",
         (todo["document_id"],),
-    ).fetchone()
+    )
     assignee = None
     if todo["assignee_id"] is not None:
-        u = conn.execute("SELECT name FROM users WHERE id = ?", (todo["assignee_id"],)).fetchone()
+        u = db.fetchone("SELECT name FROM users WHERE id = ?", (todo["assignee_id"],))
         assignee = u["name"] if u else None
     record = {
-        "id": todo["id"],
-        "document_id": todo["document_id"],
+        "id": todo["idx"],
+        "document_id": doc["idx"] if doc else None,
         "doc_title": doc["title"] if doc else None,
         "doc_flavor": doc["flavor"] if doc else None,
         "doc_path": doc["doc_path"] if doc else None,
@@ -371,15 +402,14 @@ def cmd_todo_show(args: argparse.Namespace) -> None:
 
 
 def cmd_todo_update(args: argparse.Namespace) -> None:
-    conn = connect(resolve_db(args))
-    todo = get_todo(conn, args.id)
+    db = connect(args)
+    todo = get_todo_by_idx(db, args.id)
     updates: dict[str, Any] = {}
     if args.status is not None:
-        if args.status not in STATUSES:
-            die(f"invalid status {args.status!r}; allowed: {', '.join(STATUSES)}")
+        validate_status(args.status)
         updates["status"] = args.status
     if args.assignee is not None:
-        updates["assignee_id"] = _resolve_assignee(conn, args.assignee)
+        updates["assignee_id"] = _resolve_assignee_uuid(db, args.assignee)
     if args.priority is not None:
         updates["priority"] = args.priority
     if args.blocks is not None:
@@ -387,41 +417,42 @@ def cmd_todo_update(args: argparse.Namespace) -> None:
             updates["blocks"] = None
         else:
             blocks = csv_ints(args.blocks)
-            _validate_blocks(conn, blocks, this_id=todo["id"])
+            _validate_blocks(db, blocks, this_idx=todo["idx"])
             updates["blocks"] = canonicalize_blocks(blocks)
     if not updates:
         print("nothing to update")
         return
     cols = ", ".join(f"{k} = ?" for k in updates)
-    conn.execute(
-        f"UPDATE todos SET {cols}, updated_at = datetime('now') WHERE id = ?",
-        list(updates.values()) + [todo["id"]],
+    db.execute(
+        f"UPDATE todos SET {cols}, updated_at = ? WHERE id = ?",
+        [*updates.values(), now_iso(), todo["id"]],
     )
-    conn.commit()
-    print(f"todo updated: id={todo['id']}")
+    db.commit()
+    print(f"todo updated: id={todo['idx']}")
 
 
 def cmd_todo_delete(args: argparse.Namespace) -> None:
-    conn = connect(resolve_db(args))
-    conn.execute("DELETE FROM todos WHERE id = ?", (args.id,))
-    conn.commit()
+    db = connect(args)
+    todo = get_todo_by_idx(db, args.id)
+    db.execute("DELETE FROM todos WHERE id = ?", (todo["id"],))
+    db.commit()
     print(f"todo deleted: id={args.id}")
 
 
 def cmd_priority_set(args: argparse.Namespace) -> None:
-    conn = connect(resolve_db(args))
-    get_todo(conn, args.id)
-    conn.execute(
-        "UPDATE todos SET priority = ?, updated_at = datetime('now') WHERE id = ?",
-        (args.value, args.id),
+    db = connect(args)
+    todo = get_todo_by_idx(db, args.id)
+    db.execute(
+        "UPDATE todos SET priority = ?, updated_at = ? WHERE id = ?",
+        (args.value, now_iso(), todo["id"]),
     )
-    conn.commit()
+    db.commit()
     print(f"priority set: id={args.id} value={args.value}")
 
 
 def cmd_priority_guidance_get(args: argparse.Namespace) -> None:
-    conn = connect(resolve_db(args))
-    text = load_guidance(conn)
+    db = connect(args)
+    text = load_guidance(db)
     if args.format == "json":
         print(json.dumps({"guidance": text}, indent=2))
     else:
@@ -437,31 +468,29 @@ def cmd_priority_guidance_set(args: argparse.Namespace) -> None:
         die("provide --text or --from-file")
     if not text.strip():
         die("guidance text is empty")
-    conn = connect(resolve_db(args))
-    conn.execute(
+    db = connect(args)
+    db.execute(
         "INSERT INTO config(key, value) VALUES (?, ?) "
-        "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+        "ON CONFLICT (key) DO UPDATE SET value = excluded.value",
         (GUIDANCE_KEY, text),
     )
-    conn.commit()
+    db.commit()
     print(f"priority guidance set ({len(text)} chars)")
 
 
-# ---------- argparse wiring ----------
+# ---------- argparse ----------
 
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(prog="tm.py", description=__doc__.strip().splitlines()[0])
     sub = p.add_subparsers(dest="cmd", required=True)
 
     def add_db(ap):
-        ap.add_argument("--db", help=f"path to SQLite file (or set ${ENV_DB})")
+        ap.add_argument("--db", help=f"sqlite path or postgres:// URI (or set ${ENV_DB})")
 
-    # init
     a = sub.add_parser("init", help="create users + todos tables on an existing meta-doc DB")
     add_db(a)
     a.set_defaults(func=cmd_init)
 
-    # user
     pu = sub.add_parser("user", help="manage users").add_subparsers(dest="sub", required=True)
     x = pu.add_parser("add"); add_db(x); x.add_argument("--name", required=True)
     x.set_defaults(func=cmd_user_add)
@@ -473,7 +502,6 @@ def build_parser() -> argparse.ArgumentParser:
     g.add_argument("--id", type=int); g.add_argument("--name")
     x.set_defaults(func=cmd_user_delete)
 
-    # todo
     pt = sub.add_parser("todo", help="manage todos").add_subparsers(dest="sub", required=True)
     x = pt.add_parser("add"); add_db(x)
     x.add_argument("--doc-id", type=int, required=True)
@@ -488,6 +516,14 @@ def build_parser() -> argparse.ArgumentParser:
     x.add_argument("--doc-id", type=int)
     x.add_argument("--format", choices=["table", "json"], default="table")
     x.set_defaults(func=cmd_todo_list)
+    x = pt.add_parser("top", help="show top-N highest-priority non-done todos")
+    add_db(x)
+    x.add_argument("--limit", type=int, default=1)
+    x.add_argument("--assignee", help="user name, or NONE for unassigned")
+    x.add_argument("--include-done", action="store_true",
+                   help="include todos with status=done")
+    x.add_argument("--format", choices=["table", "json"], default="table")
+    x.set_defaults(func=cmd_todo_top)
     x = pt.add_parser("show"); add_db(x)
     x.add_argument("--id", type=int, required=True)
     x.add_argument("--format", choices=["table", "json"], default="table")
@@ -503,7 +539,6 @@ def build_parser() -> argparse.ArgumentParser:
     x.add_argument("--id", type=int, required=True)
     x.set_defaults(func=cmd_todo_delete)
 
-    # priority
     pp = sub.add_parser("priority", help="manage todo priorities").add_subparsers(
         dest="sub", required=True)
     x = pp.add_parser("set", help="set an arbitrary priority value on one todo")

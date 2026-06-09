@@ -6,8 +6,8 @@ description: Track actionable todos drawn from `flavor = 'todo'` meta-documents 
 # todo-manager
 
 Per-document workflow state for action items recorded as `flavor = 'todo'`
-meta-documents. Lives in the same SQLite file used by `meta-doc-manager` —
-todos reference `documents.id` directly (FK).
+meta-documents. Lives in the same database (SQLite or Postgres) used by
+`meta-doc-manager` — todos reference `documents.id` directly (FK).
 
 ## Mental model
 
@@ -41,10 +41,11 @@ Do **not** use this skill to:
 
 ## Storage
 
-Lives in the same SQLite file as `meta-doc-manager`. `tm.py init --db PATH`
-creates the `users` and `todos` tables on an existing meta-doc DB and seeds
-default priority categories. There is no separate DB for todos; the FK on
-`todos.document_id → documents.id` requires they share the file.
+Lives in the same database as `meta-doc-manager` — either a SQLite file or
+a Postgres URI. `tm.py init --db PATH` creates the `users` and `todos` tables
+on an existing meta-doc DB and seeds the default priority guidance. There is
+no separate DB for todos; the FK on `todos.document_id → documents.id`
+requires they share the connection.
 
 ## CLI
 
@@ -52,9 +53,10 @@ default priority categories. There is no separate DB for todos; the FK on
 python ~/.claude/skills/todo-manager/scripts/tm.py <command> [...]
 ```
 
-(Adjust the path to wherever the skill lives. Stdlib-only, no third-party
-dependencies. The `META_DOC_MANAGER_DB` env var supplies a default for
-`--db` if set; don't set it unless the user asks.)
+(Adjust the path to wherever the skill lives. SQLite usage is stdlib-only;
+Postgres usage additionally requires `psycopg[binary]>=3`. `PATH` below may
+be a SQLite path *or* a Postgres URI. The `META_DOC_MANAGER_DB` env var
+supplies a default for `--db` if set; don't set it unless the user asks.)
 
 ```
 tm.py init                       --db PATH
@@ -68,6 +70,8 @@ tm.py todo add                   --db PATH --doc-id N
                                  [--blocks ID,ID,...] [--priority INT]
 tm.py todo list                  --db PATH [--status S] [--assignee NAME|NONE]
                                  [--doc-id N] [--format table|json]
+tm.py todo top                   --db PATH [--limit N] [--assignee NAME|NONE]
+                                 [--include-done] [--format table|json]
 tm.py todo show                  --db PATH --id N [--format table|json]
 tm.py todo update                --db PATH --id N
                                  [--status S] [--assignee NAME|NONE]
@@ -81,8 +85,20 @@ tm.py priority guidance set      --db PATH (--text STR | --from-file PATH)
 
 See `references/schema.md` for the schema. Prefer the CLI for writes; it
 enforces the flavor check, validates the blocks DAG (cycle detection),
-canonicalizes the JSON-list form of `blocks`, and seeds defaults. Raw
-`sqlite3 SELECT` is fine for one-off reads.
+canonicalizes the JSON-list form of `blocks`, and seeds defaults. Note that
+the integer the CLI calls `id` is the `idx` column in the schema; the
+actual PK is a UUID string.
+
+**Don't write ad-hoc SQL against this DB.** If the user asks a question
+the existing subcommands don't answer (e.g. "what's the top priority
+todo?", "what's blocking X?", "what's the oldest backlog item?"), do not
+reach for raw `sqlite3` queries. Instead, first ask the user whether to
+extend `tm.py` with a new subcommand that captures the question. The
+short-term cost (one extra round trip + small script edit) buys a
+repeatable, documented capability for next time, and avoids drift between
+what the schema reference promises and what ad-hoc queries assume. Only
+fall back to raw SQL if the user explicitly declines the extension or
+asks for a one-off read they don't want codified.
 
 ## Actions
 
@@ -171,6 +187,20 @@ tm.py todo list --db PATH --assignee NONE         # unassigned
 
 `tm.py todo show --id N` shows the todo plus its linked document (title,
 flavor, path or content preview).
+
+For "what's the top priority?" style questions, use `tm.py todo top`:
+
+```
+tm.py todo top --db PATH                 # single top non-done todo
+tm.py todo top --db PATH --limit 5       # top 5
+tm.py todo top --db PATH --assignee alice
+tm.py todo top --db PATH --include-done  # include status=done in ranking
+```
+
+`top` is just `list` ordered by `priority DESC NULLS LAST, idx ASC` with
+`status != 'done'` applied by default and a `LIMIT`. Use it whenever the
+user asks "what should I work on next?" or "what's the most important
+todo right now?".
 
 ## Conventions and judgment
 

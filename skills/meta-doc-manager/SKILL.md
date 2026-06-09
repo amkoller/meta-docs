@@ -7,7 +7,7 @@ description: Track and index "meta-documentation" about a codebase — topics, m
 
 A bookkeeping system for "meta-documentation" about a codebase: the topics the code is organized into, the modules (files, directories, or symbols) belonging to each topic, and the various documents that describe, review, plan, or audit those topics and modules.
 
-The skill is **track-and-index only**. Document content lives in plain files on disk — wherever the user wants. This skill maintains a SQLite database that records what exists, what it covers, and where to find it.
+The skill is **track-and-index only**. Document content lives in plain files on disk — wherever the user wants. This skill maintains a database (SQLite or Postgres) that records what exists, what it covers, and where to find it.
 
 ## Mental model
 
@@ -36,10 +36,17 @@ Do **not** use this skill to write the document content itself; that is the user
 
 The user picks where to put things. Two paths matter:
 
-1. **Database path** — typically a single `.sqlite` file. The skill never assumes a location; always ask, or use the path the user has already established for the project.
+1. **Database** — either a single `.sqlite` file path or a `postgresql://` /
+   `postgres://` connection URI. The CLI sniffs the form of `--db` and picks
+   the backend; the schema and command surface are identical either way. See
+   `references/postgres.md` for the Postgres setup notes (local Docker, RDS).
+   The skill never assumes a location; always ask, or use the value the user
+   has already established for the project.
 2. **Document files** — the user decides. Stored anywhere; the database records the path (absolute or relative — be consistent within a project).
 
 For convenience, the CLI honors the `META_DOC_MANAGER_DB` env var as a default for `--db`. Don't set it unless the user asks.
+
+The Postgres backend requires `psycopg` v3 (`pip install 'psycopg[binary]>=3'`); the SQLite backend uses only the Python stdlib.
 
 ## CLI
 
@@ -49,13 +56,12 @@ All actions go through one Python entry point. From any working directory:
 python ~/.claude/skills/meta-doc-manager/scripts/cm.py <command> [...]
 ```
 
-(Adjust the path if the skill lives elsewhere. The script has no third-party dependencies — stdlib only.)
+(Adjust the path if the skill lives elsewhere. SQLite usage is stdlib-only; Postgres usage additionally requires `psycopg[binary]>=3`.)
 
-Run `python .../cm.py --help` or `... <command> --help` for argument details. The high-level command surface:
+Run `python .../cm.py --help` or `... <command> --help` for argument details. The high-level command surface (`PATH` below means a SQLite path *or* a Postgres URI):
 
 ```
 cm.py init          --db PATH [--project-root PATH] [--docs-root PATH]
-cm.py migrate       --db PATH
 
 cm.py topic add     --db PATH --name STR [--parent SLUG] [--slug SLUG] [--description STR]
 cm.py topic list    --db PATH [--format tree|json|table]
@@ -95,7 +101,7 @@ cm.py select        --db PATH [--topic SLUG] [--no-topic] [--kind ...]
 
 **Treat "I want to run raw SQL" as a signal, not a failure.** If you find yourself reaching for `sqlite3 SELECT ...` or a bespoke `INSERT`, that means `cm.py` is missing a subcommand the manager genuinely needs. Don't suppress the impulse — write the missing subcommand. The right loop is: notice the gap, add (or extend) a `cm.py` subcommand that fits the operation cleanly, then use it. Over time the script grows to cover the real operations callers care about, and ad-hoc SQL becomes rare on its own.
 
-See `references/schema.md` for the full database schema if you need to write a custom query the CLI doesn't cover. Raw SQL via `sqlite3` is fine for one-off reads; prefer the CLI for writes so invariants (depth cap, unique constraints, flavor strings) are enforced consistently.
+See `references/schema.md` for the full database schema if you need to write a custom query the CLI doesn't cover. Raw SQL is fine for one-off reads; prefer the CLI for writes so invariants (depth cap, unique constraints, flavor strings) are enforced consistently. Note that `id` columns are UUID strings — the integer the CLI displays as `id` is actually the `idx` column, which is the readable handle.
 
 ## Actions
 
@@ -103,9 +109,11 @@ These are the canonical workflows the skill supports. They map closely to what t
 
 ### 1. Initialize
 
-Run `cm.py init --db <path>` once per project. This creates the SQLite file and schema. Ask the user where the DB should live before running this. Optionally record `--project-root` (so paths can be stored relative to it) and `--docs-root` (a default base for document files).
+Run `cm.py init --db <path-or-uri>` once per project. This creates the database (if it doesn't exist) and runs the `CREATE TABLE IF NOT EXISTS` script — safe to re-run. Ask the user where the DB should live before running this; a local SQLite path and a Postgres URI are equally supported. Optionally record `--project-root` (so paths can be stored relative to it) and `--docs-root` (a default base for document files).
 
-A **project** may be an umbrella directory containing multiple sibling repos — for example `~/projects/starkeep/` holds `starkeep-core/`, `starkeep-org/`, `starkeep-apps/`. Set `--project-root` to the umbrella, not any single git repo; the index then spans them coherently. The `repo_root` key from earlier schema versions has been renamed to `project_root`; run `cm.py migrate --db <path>` on any existing DB to apply the rename.
+A **project** may be an umbrella directory containing multiple sibling repos — for example `~/projects/starkeep/` holds `starkeep-core/`, `starkeep-org/`, `starkeep-apps/`. Set `--project-root` to the umbrella, not any single git repo; the index then spans them coherently.
+
+The skill does not maintain a migration system. If the schema ever changes, the change ships as an updated `META_DOC_SCHEMA_SQL` in `scripts/db.py` (always idempotent via `IF NOT EXISTS`), and a one-shot helper at `scripts/_one_time_migrate_local.py` can be used to carry an old local DB forward.
 
 ### 2. Establish topics
 
@@ -204,4 +212,5 @@ If the underlying file is moved, pass `--doc-path` with the new location. The sk
 
 ## Reference
 
-- `references/schema.md` — full SQLite schema, with field-level notes and example queries. Read this when you need to write custom SQL or understand a constraint the CLI enforces.
+- `references/schema.md` — full database schema (identical for SQLite and Postgres), with field-level notes and example queries. Read this when you need to write custom SQL or understand a constraint the CLI enforces.
+- `references/postgres.md` — how to point `--db` at a local Postgres (Docker snippet) or AWS RDS instance.
