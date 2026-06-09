@@ -60,6 +60,7 @@ cm.py migrate       --db PATH
 cm.py topic add     --db PATH --name STR [--parent SLUG] [--slug SLUG] [--description STR]
 cm.py topic list    --db PATH [--format tree|json|table]
 cm.py topic update  --db PATH --slug SLUG [--name STR] [--parent SLUG|NONE] [--description STR]
+cm.py topic rename-slug --db PATH --slug SLUG --new-slug SLUG
 cm.py topic delete  --db PATH --slug SLUG
 
 cm.py module add    --db PATH --kind file|dir|symbol --path PATH [--symbol NAME] [--description STR]
@@ -74,6 +75,7 @@ cm.py doc add       --db PATH --flavor STR --title STR --doc-path PATH
                     [--summary STR] [--created-by STR] [--source-ref STR]
                     [--topics SLUG,SLUG] [--modules ID,ID]
 cm.py doc list      --db PATH [--flavor STR] [--topic SLUG] [--module ID] [--format table|json]
+cm.py doc flavors   --db PATH [--format table|json]
 cm.py doc show      --db PATH --id N [--format table|json]
 cm.py doc update    --db PATH --id N [--title STR] [--summary STR] [--doc-path PATH]
                     [--flavor STR] [--source-ref STR]
@@ -167,8 +169,10 @@ cm.py doc add --db ... \
   --modules 12,17,29
 ```
 
+Alternatively, store the body inline in the DB by replacing `--doc-path` with `--content "..."` (a literal string) or `--content-file path/to/body.md` (read the file's contents at add-time and store them inline). Exactly one of `--doc-path` / `--content` / `--content-file` is required. Inline mode is the right choice when the index will eventually be served from a centralized server where filesystem paths stop being meaningful; file-backed mode is the right choice when the doc benefits from version control alongside the codebase.
+
 Notes:
-- `--flavor` is freeform. Use the user's existing flavors when possible — `cm.py doc list --format table` near the top will show what's been used. Slash-separated subtypes (`code-review/security`) are a useful convention but not required.
+- `--flavor` is freeform. Use the user's existing flavors when possible — `cm.py doc flavors` shows distinct flavors already in use with their document counts. Slash-separated subtypes (`code-review/security`) are a useful convention but not required.
 - `--created-by` is freeform too. `human`, `claude`, `mixed`, or a tool name are all reasonable.
 - `--source-ref` is typically a git SHA at the time of authoring. Optional but valuable for staleness reasoning later.
 - A document should link to **either** topics, modules, or both. Linking to a topic implicitly covers its modules at the time the doc was written; linking to specific modules is more precise. Use both when a document is scoped to a topic but specifically focused on certain modules.

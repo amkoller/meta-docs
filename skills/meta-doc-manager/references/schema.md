@@ -12,7 +12,7 @@ Key/value bag for project-wide settings.
 | value  | TEXT | not null                                          |
 
 Known keys:
-- `schema_version` — integer as string, currently `"1"`.
+- `schema_version` — integer as string, currently `"2"`.
 - `project_root` — absolute path to the project, if recorded. A "project" may be an umbrella directory containing multiple sibling repos (e.g. `~/projects/starkeep/` holding `starkeep-core/`, `starkeep-org/`, `starkeep-apps/`); use the umbrella, not any single repo. *(Renamed from `repo_root` in schema version 1; run `cm.py migrate` on older DBs.)*
 - `docs_root` — default base for document paths, if recorded.
 - `path_mode` — `"relative"` or `"absolute"` (advisory; not enforced).
@@ -65,19 +65,22 @@ Primary key: `(topic_id, module_id)`.
 
 ## `documents`
 
-A meta-document on disk.
+A meta-document. Body is stored in **one of two modes**: either as a path to an external file (`doc_path`) or inline in the DB (`content`). A `CHECK` constraint enforces exactly one is non-null per row, so every document has exactly one body location.
 
 | column      | type    | notes                                                            |
 |-------------|---------|------------------------------------------------------------------|
 | id          | INTEGER | primary key                                                      |
 | flavor      | TEXT    | not null; freeform (`functional-review`, `code-review/security`, etc.) |
 | title       | TEXT    | not null                                                         |
-| doc_path    | TEXT    | not null; path to the document file                              |
+| doc_path    | TEXT    | nullable; path to the external document file. Must be null when `content` is set. |
+| content     | TEXT    | nullable; inline document body. Must be null when `doc_path` is set. |
 | summary     | TEXT    | nullable                                                         |
 | created_by  | TEXT    | nullable; freeform (`human`, `claude`, `mixed`, tool name)       |
 | source_ref  | TEXT    | nullable; typically a git SHA at the time of authoring           |
 | created_at  | TEXT    | not null                                                         |
 | updated_at  | TEXT    | not null                                                         |
+
+Storage-mode invariant: `CHECK ((doc_path IS NOT NULL) <> (content IS NOT NULL))`. Use file-backed mode when the doc lives alongside the codebase and benefits from version control; use inline mode when the DB itself is the source of truth (e.g. when this index will eventually be served from a centralized server where filesystem paths are meaningless).
 
 ## `document_topics` / `document_modules`
 

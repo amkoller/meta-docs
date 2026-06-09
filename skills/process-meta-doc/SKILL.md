@@ -1,6 +1,6 @@
 ---
 name: process-meta-doc
-description: Use registered meta-documentation (from meta-doc-manager) to answer questions about a codebase or to drive action on the review/suggestion sections of those docs. Two modes — (a) Q&A mode looks up the relevant docs by topic, reads them, and answers, with explicit citation to the source doc and its date when the answer is doc-only; (b) review-processing mode walks the user through Part-2-style review items (questionable purposes, missing behaviors, behavioral bugs, potential gaps, suggestions) and helps decide what to do about each. Use this skill whenever the user asks a question about a documented part of the codebase, references existing meta-docs/reviews/audits, or wants to "process / triage / address / work through" the findings in a registered review. Pairs with meta-doc-manager (which indexes the docs) and write-meta-doc (which produces them) — this skill is the consumer-side counterpart.
+description: Use registered meta-documentation (from meta-doc-manager) to answer questions about a codebase or to drive action on the review/suggestion sections of those docs. Two modes — (a) Q&A mode looks up the relevant docs by topic, reads them, and answers, with explicit citation to the source doc and its date when the answer is doc-only; (b) review-processing mode walks the user through the doc's open questions, suggested changes, and recommendations (whatever shape they take — e.g. for functional-doc the Part 2 subsections of questionable purposes / missing behaviors / behavioral bugs / potential gaps; for code-reviews a Findings list; for test-plans a Gaps section) and helps decide what to do about each. Use this skill whenever the user asks a question about a documented part of the codebase, references existing meta-docs/reviews/audits, or wants to "process / triage / address / work through" the findings in a registered review. Pairs with meta-doc-manager (which indexes the docs) and write-meta-doc (which produces them) — this skill is the consumer-side counterpart.
 ---
 
 # process-meta-doc
@@ -106,8 +106,8 @@ Before starting, read the meta-doc-manager config key `keep-action-log` for the 
 cm config get --db <DB> --key keep-action-log
 ```
 
-- Missing key, or value `false`/`0`/`off` → **OFF** (default). Lightweight policy: items are *removed* from Part 2 as they're resolved, and deferred work becomes a separate `todo` meta-doc.
-- Value `true`/`1`/`on` → **ON**. Heavyweight policy: items are *preserved* in Part 2 with a `**Resolved (...)**` marker, and the doc gets a `## Review action log` appended.
+- Missing key, or value `false`/`0`/`off` → **OFF** (default). Lightweight policy: items are *removed* from the doc's review section as they're resolved, and deferred work becomes a separate `todo` meta-doc.
+- Value `true`/`1`/`on` → **ON**. Heavyweight policy: items are *preserved* in place with a `**Resolved (...)**` marker, and the doc gets a `## Review action log` appended.
 
 This is per-project (lives in the project's meta-doc-manager DB), so the setting reflects the maintainer's preference for *this* codebase, not a global Claude setting. If the user wants to flip it, run `cm config set --key keep-action-log --value true`.
 
@@ -117,7 +117,15 @@ The choice affects §4 only; everything else (selecting docs, picking an interac
 
 Same topic-mapping as Q&A. Then filter to docs that have a review/evaluation section — typically `functional-doc`, `code-review/*`, `test-plan`, etc. (the user's flavor vocabulary). When in doubt, list candidates and ask.
 
-For each selected doc, **read it in full** and extract the review items. The shape depends on the flavor — for `functional-doc` the relevant section is "Part 2 — Review and evaluation" with subsections like Questionable purposes / Behavior inconsistent with purpose / Missing behaviors / Behavioral bugs / Potential gaps. Treat each bullet/paragraph as one item.
+For each selected doc, **read it in full** and extract the review items. A "review item" is anything the doc surfaces as an **open question, a suggested change, or a recommendation** — the heading that holds them varies by flavor:
+
+- `functional-doc` → "Part 2 — Review and evaluation" (sub-sections: Questionable purposes / Behavior inconsistent with purpose / Missing behaviors / Behavioral bugs / Potential gaps), plus the Part 1 "Open questions" subsection.
+- `code-review/*` → a "Findings" or "Issues" list.
+- `test-plan` / `test-coverage` → "Gaps", "Open questions", or "Recommendations".
+- `user-manual` → typically none, but watch for an "Open questions" or "Known issues" footer.
+- `todo` → the whole doc is one item.
+
+If the doc doesn't have an obvious review section, scan it for paragraphs framed as questions, "should we…" prompts, or "TODO/FIXME/Note:" callouts and treat those as items. Treat each bullet/paragraph as one item.
 
 Build a working list with a stable order (doc, subsection, position) so you can refer to items by number throughout the session.
 
@@ -136,7 +144,8 @@ Defaults: if the doc has ≤5 items, one-by-one. If >5, offer filter-then-proces
 Outcomes are not constrained to "fix the code". A review item can resolve as any of:
 
 - **Address now (code change)** — make the code change in the codebase; record what was done.
-- **Address now (doc clarification)** — the item turns out to be a documentation bug, not a code bug; fix the doc.
+- **Address now (code comment)** — the underlying concern is real but the right response is to encode the invariant / caveat as a comment in the relevant code (not as a code-behavior change and not as an edit to the review doc). Common when the item flags a "fragile invariant" or "surprising assumption" that future readers of the code need to see.
+- **Address now (doc clarification)** — the item turns out to be a documentation bug; fix the doc. The target can be any doc *other than the review item itself* — including the descriptive part of the same review doc (e.g. Part 1 of a functional-doc), a different meta-doc, architecture-intent, a sibling functional doc, CLAUDE.md, a README, etc. What is **not** allowed is treating "edit the review-item bullet itself" as a resolution: in lightweight mode that bullet is deleted as the item is resolved, so editing it as the "fix" while also deleting it is incoherent. If the only meaningful clarification *is* the bullet itself, the item is effectively a no-op and should be dismissed with a reason. Updating Part 1 prose (or other descriptive sections) of the same doc to reflect post-resolution reality — or to clarify a misreading the item identified — is fine and often the right move.
 - **Defer** — real issue, not now; record why + when to revisit.
 - **Dismiss** — not actually an issue (e.g. the reviewer was wrong, or context has changed); record the reason.
 - **Convert to external action** — file an issue, open a PR, post to a tracker; record the link.
@@ -147,32 +156,36 @@ When the outcome is a code change, make the change as you would normally (Edit/W
 
 ## 4. Update the doc in place
 
-The mechanics depend on `keep-action-log` (see §0). In both modes, after code changes, also refresh the doc's index registration — at minimum the `source_ref` (to the new SHA in the most-relevant repo for this topic; for multi-repo projects pick the repo whose code the resolutions touched) and the `updated_at` (refreshed automatically by `doc update`). Update the `summary` if the doc's scope shifted.
+The mechanics depend on `keep-action-log` (see §0). In both modes, after code changes, update the doc's `summary` via `cm doc update` if the scope shifted (e.g. an item was resolved that the summary called out).
+
+**Do not bump `source_ref` yourself.** The SHA only meaningfully changes when the user commits, and the user is the one who commits — so the user will request the bump. After the resolutions, *suggest* the next steps ("commit these changes, then ask me to bump doc N's `source_ref` to the new SHA"), but leave the actual `--source-ref` update to a follow-up turn the user initiates. Setting it to the current HEAD before the commit lands records a SHA that does not contain the resolutions and is actively misleading.
 
 Effective ops:
 ```
-cm doc update --db <DB> --id <doc-id> --source-ref <new-sha> [--summary "<...>"]
+cm doc update --db <DB> --id <doc-id> [--summary "<...>"]      # safe to run now
+cm doc update --db <DB> --id <doc-id> --source-ref <new-sha>   # only when user asks, after their commit
 cm doc show   --db <DB> --id <doc-id>
 ```
 
 ### 4a. Lightweight mode (`keep-action-log` OFF — default)
 
-Items are *removed* from Part 2 as they're resolved. Deferred work becomes a separate `todo` meta-doc so it stays trackable without bloating the review.
+Items are *removed* from the doc as they're resolved. Deferred work becomes a separate `todo` meta-doc so it stays trackable without bloating the review.
 
-Per outcome:
+Per outcome (in each case, "delete the item" means remove its whole bullet/paragraph from wherever it lives in the doc, including sub-bullets):
 
-- **Address now (code change)** — make the code change. Then **delete the item from Part 2** of the review (its whole bullet/paragraph, including any sub-bullets). If the fix is partial or you decide to defer follow-ups, create a `todo` meta-doc (see below) for the remainder before deleting the item.
-- **Address now (doc clarification)** — fix the doc (the same review doc, or a related one). Then delete the item from Part 2. If the clarification reveals follow-up work, file it as a `todo`.
-- **Defer** — **do not** edit Part 2 to add a "deferred" marker. Instead, write a new `todo` meta-doc (see below), then delete the item from Part 2.
-- **Dismiss** — just delete the item from Part 2. No todo, no marker.
-- **Convert to external action** — file the issue / PR / tracker entry, then delete the item from Part 2. The external system is the record; no todo needed.
+- **Address now (code change)** — make the code change. Then delete the item. If the fix is partial or you decide to defer follow-ups, create a `todo` meta-doc (see below) for the remainder before deleting the item.
+- **Address now (code comment)** — add the comment to the relevant code file. Then delete the item.
+- **Address now (doc clarification)** — fix the *related* doc (not the review doc itself — see §3). Then delete the item. If the clarification reveals follow-up work, file it as a `todo`.
+- **Defer** — **do not** edit the doc to add a "deferred" marker in place. Instead, write a new `todo` meta-doc (see below), then delete the item.
+- **Dismiss** — just delete the item. No todo, no marker.
+- **Convert to external action** — file the issue / PR / tracker entry, then delete the item. The external system is the record; no todo needed.
 
-If after processing the review section (e.g. "Behavioral bugs") is empty, you may leave the heading in place with a brief `_(no remaining items)_` placeholder or remove the heading — either is fine; pick whichever reads better.
+If a subsection (e.g. "Behavioral bugs", "Findings", "Open questions") ends up empty after processing, you may leave the heading in place with a brief `_(no remaining items)_` placeholder or remove the heading — either is fine; pick whichever reads better.
 
 **Creating a `todo` meta-doc.** Write a short markdown file (one screen) at `<docs-root>/todo-<topic-slug>-<short-name>-<YYYY-MM-DD>.md` containing:
 - A one-line title.
 - A 1–3 sentence description of what the deferred/follow-up item is and why it was deferred.
-- A pointer back to the source review by doc id and section (e.g. "From doc id 5, Part 2 — Behavioral bugs").
+- A pointer back to the source review by doc id and section heading as it appears in the source doc (e.g. "From doc id 5, Part 2 — Behavioral bugs", or "From doc id 12, Findings #4").
 - A revisit hint if there is one (a trigger, a date, a dependency).
 
 Then register it:
@@ -219,5 +232,5 @@ At the end of a processing session, give the user a one-screen summary:
 - **Don't silently broaden scope.** If the user asks about topic X and you find that the answer also requires reading docs on topic Y, mention it before reading. Topic discipline is what makes the doc index useful.
 - **Don't fabricate citations.** If you couldn't find a doc that covers something, say so. "Per the doc" is meaningful only when the doc actually says that.
 - **Doc-only answers must be flagged.** This is the single most important habit — the user should never have to ask "is that from the doc or from the code?"
-- **Resolution-edit policy follows the setting.** In heavyweight mode, preserve every Part 2 item with a resolution marker so a reader six months from now can see what was reviewed. In lightweight mode (default), remove resolved items from Part 2 and keep deferred work as separate `todo` meta-docs — the index of todos becomes the trail, not the review doc.
+- **Resolution-edit policy follows the setting.** In heavyweight mode, preserve every review item with a resolution marker in place so a reader six months from now can see what was reviewed. In lightweight mode (default), remove resolved items from the doc and keep deferred work as separate `todo` meta-docs — the index of todos becomes the trail, not the review doc.
 - **Stay in your lane.** This skill resolves items via outcomes that touch code, docs, or external trackers — it does not author new meta-docs. If a resolution genuinely requires a new doc (e.g. "this gap means we need a doc on topic Y"), record that as the outcome and hand off to `write-meta-doc` in a separate run.

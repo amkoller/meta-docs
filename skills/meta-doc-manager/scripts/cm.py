@@ -16,7 +16,7 @@ import sqlite3
 import sys
 from typing import Any, Iterable
 
-SCHEMA_VERSION = "1"
+SCHEMA_VERSION = "2"
 MAX_DEPTH = 2  # depth 0/1/2 → 3 levels total
 ENV_DB = "META_DOC_MANAGER_DB"
 
@@ -60,12 +60,14 @@ CREATE TABLE IF NOT EXISTS documents (
   id          INTEGER PRIMARY KEY AUTOINCREMENT,
   flavor      TEXT NOT NULL,
   title       TEXT NOT NULL,
-  doc_path    TEXT NOT NULL,
+  doc_path    TEXT,
+  content     TEXT,
   summary     TEXT,
   created_by  TEXT,
   source_ref  TEXT,
   created_at  TEXT NOT NULL DEFAULT (datetime('now')),
-  updated_at  TEXT NOT NULL DEFAULT (datetime('now'))
+  updated_at  TEXT NOT NULL DEFAULT (datetime('now')),
+  CHECK ((doc_path IS NOT NULL) <> (content IS NOT NULL))
 );
 
 CREATE TABLE IF NOT EXISTS document_topics (
@@ -247,9 +249,11 @@ def cmd_init(args: argparse.Namespace) -> None:
 
 
 def cmd_migrate(args: argparse.Namespace) -> None:
-    """Run idempotent config-key migrations on an existing DB.
+    """Run idempotent migrations on an existing DB.
 
-    Currently handles: repo_root -> project_root rename. Safe to re-run.
+    - repo_root -> project_root config-key rename.
+    - documents table: make doc_path nullable, add content column with CHECK.
+    Safe to re-run.
     """
     conn = connect(resolve_db(args))
     changes: list[str] = []
@@ -266,6 +270,63 @@ def cmd_migrate(args: argparse.Namespace) -> None:
     elif old and new:
         conn.execute("DELETE FROM config WHERE key='repo_root'")
         changes.append(f"dropped legacy repo_root (project_root already set to {new['value']!r})")
+
+    # documents v2: nullable doc_path + content column + CHECK constraint.
+    cols = {r["name"]: r for r in conn.execute("PRAGMA table_info(documents)").fetchall()}
+    needs_doc_rebuild = "content" not in cols or (cols.get("doc_path") and cols["doc_path"]["notnull"])
+    if needs_doc_rebuild:
+        # SQLite table-rebuild recipe (https://www.sqlite.org/lang_altertable.html#otheralter):
+        # foreign keys must be disabled around the DROP/RENAME or every ON DELETE CASCADE
+        # pointing at `documents` (e.g. todos.document_id) fires when the old table is dropped.
+        # PRAGMA foreign_keys is a no-op inside a transaction, so commit anything pending first.
+        conn.commit()
+        conn.execute("PRAGMA foreign_keys = OFF")
+        try:
+            conn.executescript(
+                """
+                CREATE TABLE documents_new (
+                  id          INTEGER PRIMARY KEY AUTOINCREMENT,
+                  flavor      TEXT NOT NULL,
+                  title       TEXT NOT NULL,
+                  doc_path    TEXT,
+                  content     TEXT,
+                  summary     TEXT,
+                  created_by  TEXT,
+                  source_ref  TEXT,
+                  created_at  TEXT NOT NULL DEFAULT (datetime('now')),
+                  updated_at  TEXT NOT NULL DEFAULT (datetime('now')),
+                  CHECK ((doc_path IS NOT NULL) <> (content IS NOT NULL))
+                );
+                """
+            )
+            content_expr = "content" if "content" in cols else "NULL"
+            conn.execute(
+                f"""INSERT INTO documents_new
+                    (id, flavor, title, doc_path, content, summary, created_by, source_ref, created_at, updated_at)
+                    SELECT id, flavor, title, doc_path, {content_expr}, summary, created_by, source_ref, created_at, updated_at
+                    FROM documents"""
+            )
+            conn.executescript(
+                """
+                DROP TABLE documents;
+                ALTER TABLE documents_new RENAME TO documents;
+                CREATE INDEX IF NOT EXISTS idx_documents_flavor ON documents(flavor);
+                """
+            )
+            # Verify no FKs were broken by the rebuild before re-enabling enforcement.
+            bad = conn.execute("PRAGMA foreign_key_check").fetchall()
+            if bad:
+                die(f"foreign_key_check failed after documents rebuild: {[tuple(r) for r in bad]}")
+            conn.commit()
+        finally:
+            conn.execute("PRAGMA foreign_keys = ON")
+        changes.append("rebuilt documents table (nullable doc_path + content + CHECK)")
+
+    conn.execute(
+        "INSERT INTO config(key, value) VALUES ('schema_version', ?) "
+        "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+        (SCHEMA_VERSION,),
+    )
 
     conn.commit()
     if changes:
@@ -383,6 +444,32 @@ def cmd_topic_update(args: argparse.Namespace) -> None:
     conn.execute(f"UPDATE topics SET {set_clause} WHERE id = ?", params)
     conn.commit()
     print(f"topic updated: {args.slug}")
+
+
+def cmd_topic_rename_slug(args: argparse.Namespace) -> None:
+    """Rename a topic's slug. Slugs are nominally stable identifiers, but if a
+    topic's meaning has shifted (e.g. the display name was corrected) the old
+    slug can become misleading. Module/document links reference by topic_id, so
+    a slug rename does not orphan anything.
+    """
+    conn = connect(resolve_db(args))
+    topic = get_topic(conn, args.slug)
+    new_slug = args.new_slug
+    if new_slug == args.slug:
+        print("nothing to update")
+        return
+    existing = conn.execute("SELECT id FROM topics WHERE slug = ?", (new_slug,)).fetchone()
+    if existing:
+        die(f"slug already in use: {new_slug}")
+    try:
+        conn.execute(
+            "UPDATE topics SET slug = ?, updated_at = datetime('now') WHERE id = ?",
+            (new_slug, topic["id"]),
+        )
+    except sqlite3.IntegrityError as e:
+        die(f"could not rename slug: {e}")
+    conn.commit()
+    print(f"topic slug renamed: {args.slug} -> {new_slug}")
 
 
 def cmd_topic_delete(args: argparse.Namespace) -> None:
@@ -518,6 +605,33 @@ def cmd_module_unassign(args: argparse.Namespace) -> None:
         print("(no such assignment)")
 
 
+def _resolve_doc_body(args: argparse.Namespace) -> tuple[str | None, str | None]:
+    """Resolve doc_path / content from CLI args. Returns (doc_path, content);
+    exactly one is non-None. Aborts with `die` if invalid combination given.
+    """
+    provided = [
+        ("--doc-path",     getattr(args, "doc_path", None)),
+        ("--content",      getattr(args, "content", None)),
+        ("--content-file", getattr(args, "content_file", None)),
+    ]
+    chosen = [(flag, val) for flag, val in provided if val is not None]
+    if len(chosen) == 0:
+        die("one of --doc-path, --content, --content-file is required")
+    if len(chosen) > 1:
+        die(f"--doc-path, --content, --content-file are mutually exclusive (got {', '.join(f for f,_ in chosen)})")
+    flag, val = chosen[0]
+    if flag == "--doc-path":
+        return val, None
+    if flag == "--content":
+        return None, val
+    # --content-file
+    try:
+        with open(val, "r", encoding="utf-8") as f:
+            return None, f.read()
+    except OSError as e:
+        die(f"could not read --content-file {val!r}: {e}")
+
+
 def cmd_doc_add(args: argparse.Namespace) -> None:
     conn = connect(resolve_db(args))
     topic_slugs = csv_strs(args.topics)
@@ -527,10 +641,11 @@ def cmd_doc_add(args: argparse.Namespace) -> None:
     for mid in module_ids:
         if not conn.execute("SELECT 1 FROM modules WHERE id = ?", (mid,)).fetchone():
             die(f"no module with id {mid}")
+    doc_path, content = _resolve_doc_body(args)
     cur = conn.execute(
-        """INSERT INTO documents(flavor, title, doc_path, summary, created_by, source_ref)
-           VALUES (?, ?, ?, ?, ?, ?)""",
-        (args.flavor, args.title, args.doc_path, args.summary, args.created_by, args.source_ref),
+        """INSERT INTO documents(flavor, title, doc_path, content, summary, created_by, source_ref)
+           VALUES (?, ?, ?, ?, ?, ?, ?)""",
+        (args.flavor, args.title, doc_path, content, args.summary, args.created_by, args.source_ref),
     )
     doc_id = cur.lastrowid
     for tid in topic_ids:
@@ -571,10 +686,19 @@ def cmd_doc_list(args: argparse.Namespace) -> None:
          columns=["id", "flavor", "title", "doc_path", "created_by", "source_ref", "created_at"])
 
 
+def cmd_doc_flavors(args: argparse.Namespace) -> None:
+    conn = connect(resolve_db(args))
+    rows = conn.execute(
+        "SELECT flavor, COUNT(*) AS count FROM documents "
+        "GROUP BY flavor ORDER BY count DESC, flavor ASC"
+    ).fetchall()
+    emit(rows, args.format, columns=["flavor", "count"])
+
+
 def cmd_doc_show(args: argparse.Namespace) -> None:
     conn = connect(resolve_db(args))
     row = conn.execute(
-        "SELECT id, flavor, title, doc_path, summary, created_by, source_ref, "
+        "SELECT id, flavor, title, doc_path, content, summary, created_by, source_ref, "
         "created_at, updated_at FROM documents WHERE id = ?",
         (args.id,),
     ).fetchone()
@@ -600,6 +724,7 @@ def cmd_doc_show(args: argparse.Namespace) -> None:
         "flavor": row["flavor"],
         "title": row["title"],
         "doc_path": row["doc_path"],
+        "content": row["content"],
         "summary": row["summary"],
         "created_by": row["created_by"],
         "source_ref": row["source_ref"],
@@ -614,6 +739,9 @@ def cmd_doc_show(args: argparse.Namespace) -> None:
         for k, v in record.items():
             if isinstance(v, list):
                 print(f"{k}: {', '.join(str(x) for x in v) if v else '-'}")
+            elif k == "content" and v is not None:
+                preview = v if len(v) <= 2048 else v[:2048] + "\n…(truncated; use --format json for full body)"
+                print(f"content: |\n{preview}")
             else:
                 print(f"{k}: {v if v is not None else '-'}")
 
@@ -654,10 +782,30 @@ def cmd_doc_update(args: argparse.Namespace) -> None:
     if not row:
         die(f"no document with id {args.id}")
     updates: dict[str, Any] = {}
-    for field in ("title", "summary", "doc_path", "flavor", "source_ref"):
+    for field in ("title", "summary", "flavor", "source_ref"):
         v = getattr(args, field.replace("-", "_"), None)
         if v is not None:
             updates[field] = v
+    body_flags = [
+        ("--doc-path",     getattr(args, "doc_path", None)),
+        ("--content",      getattr(args, "content", None)),
+        ("--content-file", getattr(args, "content_file", None)),
+    ]
+    body_chosen = [(f, v) for f, v in body_flags if v is not None]
+    if len(body_chosen) > 1:
+        die(f"--doc-path, --content, --content-file are mutually exclusive (got {', '.join(f for f,_ in body_chosen)})")
+    if body_chosen:
+        flag, val = body_chosen[0]
+        if flag == "--doc-path":
+            updates["doc_path"], updates["content"] = val, None
+        elif flag == "--content":
+            updates["doc_path"], updates["content"] = None, val
+        else:  # --content-file
+            try:
+                with open(val, "r", encoding="utf-8") as f:
+                    updates["doc_path"], updates["content"] = None, f.read()
+            except OSError as e:
+                die(f"could not read --content-file {val!r}: {e}")
     if updates:
         cols = ", ".join(f"{k} = ?" for k in updates)
         conn.execute(
@@ -891,6 +1039,11 @@ def build_parser() -> argparse.ArgumentParser:
     a.add_argument("--name"); a.add_argument("--description")
     a.add_argument("--parent", help="new parent slug, or NONE to clear")
     a.set_defaults(func=cmd_topic_update)
+    a = pt.add_parser("rename-slug", help="rename a topic's stable slug identifier")
+    add_db(a)
+    a.add_argument("--slug", required=True, help="current slug")
+    a.add_argument("--new-slug", required=True, help="new slug")
+    a.set_defaults(func=cmd_topic_rename_slug)
     a = pt.add_parser("delete"); add_db(a)
     a.add_argument("--slug", required=True)
     a.set_defaults(func=cmd_topic_delete)
@@ -936,7 +1089,10 @@ def build_parser() -> argparse.ArgumentParser:
     pd = sub.add_parser("doc", help="manage documents").add_subparsers(dest="sub", required=True)
     a = pd.add_parser("add"); add_db(a)
     a.add_argument("--flavor", required=True); a.add_argument("--title", required=True)
-    a.add_argument("--doc-path", required=True); a.add_argument("--summary")
+    a.add_argument("--doc-path", help="path to an external file holding the doc body")
+    a.add_argument("--content", help="inline doc body stored in the DB")
+    a.add_argument("--content-file", help="read inline body from this local file (stored in DB)")
+    a.add_argument("--summary")
     a.add_argument("--created-by"); a.add_argument("--source-ref")
     a.add_argument("--topics", help="comma-separated topic slugs")
     a.add_argument("--modules", help="comma-separated module ids")
@@ -945,6 +1101,10 @@ def build_parser() -> argparse.ArgumentParser:
     a.add_argument("--flavor"); a.add_argument("--topic"); a.add_argument("--module", type=int)
     a.add_argument("--format", choices=["table", "json"], default="table")
     a.set_defaults(func=cmd_doc_list)
+    a = pd.add_parser("flavors", help="list distinct flavors in use with document counts")
+    add_db(a)
+    a.add_argument("--format", choices=["table", "json"], default="table")
+    a.set_defaults(func=cmd_doc_flavors)
     a = pd.add_parser("show", help="show a single document including topics, modules, and timestamps")
     add_db(a)
     a.add_argument("--id", type=int, required=True)
@@ -952,7 +1112,10 @@ def build_parser() -> argparse.ArgumentParser:
     a.set_defaults(func=cmd_doc_show)
     a = pd.add_parser("update"); add_db(a)
     a.add_argument("--id", type=int, required=True)
-    a.add_argument("--title"); a.add_argument("--summary"); a.add_argument("--doc-path")
+    a.add_argument("--title"); a.add_argument("--summary")
+    a.add_argument("--doc-path", help="switch the doc to file-backed at this path")
+    a.add_argument("--content", help="switch the doc to inline body with this content")
+    a.add_argument("--content-file", help="switch to inline; read body from this local file")
     a.add_argument("--flavor"); a.add_argument("--source-ref")
     a.add_argument("--add-topics"); a.add_argument("--remove-topics")
     a.add_argument("--add-modules"); a.add_argument("--remove-modules")
